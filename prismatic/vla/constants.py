@@ -44,12 +44,21 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+PLACE_SHOE_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 14,
+    "PROPRIO_DIM": 14,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
+
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
     cmd_args = " ".join(sys.argv).lower()
 
-    if "libero" in cmd_args:
+    if "place_shoe" in cmd_args or "place-shoe" in cmd_args:
+        return "PLACE_SHOE"
+    elif "libero" in cmd_args:
         return "LIBERO"
     elif "aloha" in cmd_args:
         return "ALOHA"
@@ -70,6 +79,8 @@ elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS
 elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
+elif ROBOT_PLATFORM == "PLACE_SHOE":
+    constants = PLACE_SHOE_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

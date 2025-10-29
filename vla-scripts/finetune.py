@@ -386,8 +386,8 @@ def run_forward_pass(
         if use_l1_regression:
             # Predict action
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
-            # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            # Get loss using action head's configured loss type (L1, L2, Huber, etc.)
+            loss = action_head.module.compute_loss(predicted_actions, ground_truth_actions)
 
         if use_diffusion:
             # Predict noise

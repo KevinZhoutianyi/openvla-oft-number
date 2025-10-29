@@ -82,18 +82,36 @@ class MLPResNet(nn.Module):
 
 
 class L1RegressionActionHead(nn.Module):
-    """Simple MLP-based action head that generates continuous actions via L1 regression."""
+    """
+    MLP-based action head that generates continuous actions via regression.
+    
+    Supports multiple loss types:
+    - 'l1': L1 loss / Mean Absolute Error (MAE)
+    - 'l2' or 'mse': L2 loss / Mean Squared Error (MSE)  
+    - 'huber': Huber loss (smooth L1, robust to outliers)
+    - 'smooth_l1': Smooth L1 loss
+    """
     def __init__(
         self,
         input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
+        loss_type='l1',  # 'l1', 'l2', 'mse', 'huber', 'smooth_l1'
+        huber_delta=1.0,  # delta parameter for Huber loss
     ):
         super().__init__()
         self.action_dim = action_dim
+        self.loss_type = loss_type.lower()
+        self.huber_delta = huber_delta
+        
         self.model = MLPResNet(
             num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
         )
+        
+        # Validate loss type
+        valid_losses = ['l1', 'l2', 'mse', 'huber', 'smooth_l1']
+        if self.loss_type not in valid_losses:
+            raise ValueError(f"loss_type must be one of {valid_losses}, got '{self.loss_type}'")
 
     def predict_action(self, actions_hidden_states):
         # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
@@ -105,6 +123,43 @@ class L1RegressionActionHead(nn.Module):
         rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         action = self.model(rearranged_actions_hidden_states)
         return action
+    
+    def compute_loss(self, predicted_actions, ground_truth_actions):
+        """
+        Compute regression loss based on the specified loss type.
+        
+        Args:
+            predicted_actions: (batch_size, chunk_len, action_dim)
+            ground_truth_actions: (batch_size, chunk_len, action_dim)
+            
+        Returns:
+            loss: scalar tensor
+        """
+        # Store original dtype
+        original_dtype = predicted_actions.dtype
+        
+        # Convert to float32 if needed (some loss functions don't support bfloat16)
+        needs_float32 = self.loss_type in ['smooth_l1', 'huber']
+        if needs_float32 and original_dtype == torch.bfloat16:
+            predicted_actions = predicted_actions.float()
+            ground_truth_actions = ground_truth_actions.float()
+        
+        if self.loss_type == 'l1':
+            # L1 loss (Mean Absolute Error)
+            loss = torch.nn.functional.l1_loss(predicted_actions, ground_truth_actions)
+        elif self.loss_type in ['l2', 'mse']:
+            # L2 loss (Mean Squared Error)
+            loss = torch.nn.functional.mse_loss(predicted_actions, ground_truth_actions)
+        elif self.loss_type == 'huber':
+            # Huber loss (smooth L1, robust to outliers)
+            loss = torch.nn.functional.huber_loss(predicted_actions, ground_truth_actions, delta=self.huber_delta)
+        elif self.loss_type == 'smooth_l1':
+            # Smooth L1 loss (requires float32)
+            loss = torch.nn.functional.smooth_l1_loss(predicted_actions, ground_truth_actions)
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+        
+        return loss
 
 
 class NoisePredictionModel(nn.Module):

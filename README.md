@@ -95,3 +95,8 @@ If you use our code in your work, please cite [our paper](https://arxiv.org/abs/
   year={2025}
 }
 ```
+
+
+
+##TIANYI:
+run quick_test.sh

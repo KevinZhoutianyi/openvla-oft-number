@@ -1,0 +1,138 @@
+================================================================================
+                        PRESENTATION UPLOAD CHECKLIST
+================================================================================
+
+📋 Follow this checklist to upload your presentation to Overleaf
+
+================================================================================
+STEP 1: DOWNLOAD THESE FILES TO YOUR LOCAL COMPUTER
+================================================================================
+
+From /u/tzhou4/fone/openvla-oft-number/presentation/
+
+[ ] presentation_complete.tex
+
+From /u/tzhou4/fone/openvla-oft-number/presentation/dataset_images/
+
+[ ] dataset_sample.png
+[ ] sample_0.png
+[ ] sample_1.png
+[ ] sample_2.png
+[ ] sample_3.png
+
+Total: 6 files (1 .tex + 5 .png)
+
+================================================================================
+STEP 2: UPLOAD TO OVERLEAF
+================================================================================
+
+2.1 Create New Project
+[ ] Go to overleaf.com
+[ ] Click "New Project" → "Blank Project"
+[ ] Name it: "OpenVLA Fine-Tuning Presentation"
+
+2.2 Upload Main File
+[ ] Click "Upload" button
+[ ] Upload: presentation_complete.tex
+[ ] Wait for upload to complete
+
+2.3 Create Figures Folder
+[ ] Click "New Folder" button
+[ ] Name it exactly: figures
+[ ] Press Enter/Create
+
+2.4 Upload Images
+[ ] Click on the "figures" folder to open it
+[ ] Click "Upload" button
+[ ] Select all 5 PNG files:
+    [ ] dataset_sample.png
+    [ ] sample_0.png
+    [ ] sample_1.png
+    [ ] sample_2.png
+    [ ] sample_3.png
+[ ] Upload them all at once
+[ ] Wait for uploads to complete
+
+================================================================================
+STEP 3: CONFIGURE AND COMPILE
+================================================================================
+
+3.1 Set Main Document
+[ ] If presentation_complete.tex is not the main file, click on it
+[ ] Click "Menu" → Set as Main File
+
+3.2 Set Compiler
+[ ] Click "Menu" button (top left)
+[ ] Under "Settings", find "Compiler"
+[ ] Select: pdfLaTeX
+[ ] Close menu
+
+3.3 Edit Your Name
+[ ] Open presentation_complete.tex
+[ ] Find line 13: \author{Your Name}
+[ ] Change "Your Name" to your actual name
+[ ] Save (Ctrl+S)
+
+3.4 Compile
+[ ] Click "Recompile" button
+[ ] Wait for compilation (should be < 10 seconds)
+[ ] ✅ Check: PDF appears with NO errors!
+[ ] ✅ Check: All 5 images are visible in slides
+[ ] ✅ Check: All tables show your results
+
+================================================================================
+STEP 4: VERIFY PRESENTATION
+================================================================================
+
+Check these slides have content:
+
+[ ] Slide 1: Title slide with your name
+[ ] Slide 6: Dataset sample image appears
+[ ] Slide 7: 4 trajectory images appear in a row
+[ ] Slide 13: Main results table (green highlighting on L1 row)
+[ ] Slide 14: Performance rankings (L1 shown as winner)
+[ ] Slide 15: Improvement table
+[ ] Slide 16: Per-dimension errors table
+
+Total slides: ~23 (including backup slides)
+
+================================================================================
+STEP 5: FINAL CHECKS
+================================================================================
+
+[ ] PDF downloads correctly
+[ ] No "draft" placeholders or missing images
+[ ] All tables are formatted properly
+[ ] Colors show correctly (green highlighting)
+[ ] Your name appears on title slide
+[ ] Date is correct
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Problem: Compilation errors about missing figures
+Solution: Make sure figures/ folder exists and contains all 5 PNGs
+
+Problem: Images don't show, see "draft" boxes
+Solution: Check images are IN the figures/ folder, not root directory
+
+Problem: Compiler can't find files
+Solution: In Menu, make sure "Main document" is set to presentation_complete.tex
+
+Problem: Colors don't show
+Solution: Try recompiling twice (pdflatex needs 2 passes sometimes)
+
+================================================================================
+YOU'RE DONE!
+================================================================================
+
+✅ Presentation is complete and ready!
+✅ All figures are included
+✅ All results are shown in professional tables
+✅ No missing files or errors
+
+🎉 Ready to present your work! Good luck! 🚀
+
+================================================================================
+
