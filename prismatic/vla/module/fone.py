@@ -61,11 +61,11 @@ class FoNEProjector(nn.Module):
 
         B, P = proprio.shape
         if self.per_scalar:
-            feats = [self.fne(proprio[:, i:i+1]) for i in range(P)]  # list of [B, fone_hidden]
-            E = torch.stack(feats, dim=1)                            # [B, P, fone_hidden]
-            return self.norm(self.to_llm(E))                         # [B, P, D]
+            feats = [self.fne(proprio[:, i : i + 1]).squeeze(1) for i in range(P)]  # list of [B, fone_hidden]
+            E = torch.stack(feats, dim=1)  # [B, P, fone_hidden]
+            return self.norm(self.to_llm(E))  # [B, P, D]
         else:
-            feats = [self.fne(proprio[:, i:i+1]) for i in range(P)]  # [B, fone_hidden] x P
-            E = torch.cat(feats, dim=-1)                             # [B, P*fone_hidden]
-            E = self.pool(E)                                         # [B, fone_hidden]
-            return self.norm(self.to_llm(E))                         # [B, D]
+            feats = [self.fne(proprio[:, i : i + 1]).squeeze(1) for i in range(P)]  # [B, fone_hidden] x P
+            E = torch.cat(feats, dim=-1)  # [B, P*fone_hidden]
+            E = self.pool(E)  # [B, fone_hidden]
+            return self.norm(self.to_llm(E))  # [B, D]

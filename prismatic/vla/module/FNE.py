@@ -1,12 +1,10 @@
-import logging  
-import torch.nn as nn
-import torch
-import pdb
-import torch.nn.functional as F
+import logging
 import math
-import numpy as np
 import time
-import pdb
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # Fourier Embedding Class
 class FNE(nn.Module):
@@ -20,11 +18,18 @@ class FNE(nn.Module):
         device="cpu",
     ):
         super().__init__()
-        print(f'---- \n fourier embedding initing... int_digit_len = {int_digit_len},  frac_digit_len = {frac_digit_len}, period_base_list = {period_base_list}, embedding dim= {embedding_dim}')
+        print(
+            f"---- \n fourier embedding initing... int_digit_len = {int_digit_len},  "
+            f"frac_digit_len = {frac_digit_len}, period_base_list = {period_base_list}, embedding dim= {embedding_dim}"
+        )
         self.add_linear = add_linear
         device = torch.device(device)
         # Initialize period list for Fourier embedding
-        self.period_list = self._get_period_list(period_base_list, minvalue=10**(-frac_digit_len), maxvalue=10**(int_digit_len+1)-1)
+        self.period_list = self._get_period_list(
+            period_base_list,
+            minvalue=10 ** (-frac_digit_len),
+            maxvalue=10 ** (int_digit_len + 1) - 1,
+        )
         logging.info(f"period_list: {self.period_list}")
         self.period_base_list_len = len(period_base_list)
         # Create and register the precomputed cosine/sine matrix as a buffer
@@ -36,23 +41,25 @@ class FNE(nn.Module):
         self.register_buffer("period_tensor", period_tensor)
         frequencies = (2 * torch.pi / period_tensor).to(device)
         self.register_buffer("frequencies", frequencies)
-        
+
         # Initialize other attributes
         self.embedding_dim = embedding_dim
         self.linear = nn.Linear(self.embedding_dim, self.embedding_dim)
-        self.layer_norm = nn.LayerNorm(embedding_dim, eps=1e-5).to(device)
-        self.device = device
-        
+        self.layer_norm = nn.LayerNorm(embedding_dim, eps=1e-5)
+
         # Precompute powers of ten for digit manipulation and register as a buffer
         self.max_num_digits = int_digit_len + frac_digit_len
-        powers_of_ten = torch.pow(10, torch.arange(self.max_num_digits, device=device)).long()[-(int_digit_len+frac_digit_len):]
+        powers_of_ten = torch.pow(10, torch.arange(self.max_num_digits, device=device)).long()[
+            -(int_digit_len + frac_digit_len) :
+        ]
         self.register_buffer("powers_of_ten", powers_of_ten)
         self.register_buffer("powers_of_ten_flipped", powers_of_ten.flip(0))
         logging.info(f"self.powers_of_ten: {self.powers_of_ten}")
-        
 
-        #for weighted loss
-        self.digit_weights = torch.arange(1, self.max_num_digits + 1).to(device)
+        # for weighted loss
+        digit_weights = torch.arange(1, self.max_num_digits + 1, device=device, dtype=torch.float32)
+        self.register_buffer("digit_weights", digit_weights, persistent=False)
+
     def forward(self, number_scatter, len_gen=None):
         """Compute Fourier-based embedding with a linear transformation."""
         fourier_embedding = self.fourier_embedding(number_scatter, len_gen=len_gen)
@@ -77,7 +84,7 @@ class FNE(nn.Module):
         masked_number_in_hidden_space = number_in_hidden_space.view(*number_scatter.shape, -1) * mask
         return masked_number_in_hidden_space
 
-    def _get_period_list(self,  period_base_list=[2, 5], minvalue=1e-5,maxvalue=1e5):
+    def _get_period_list(self, period_base_list=[2, 5], minvalue=1e-5, maxvalue=1e5):
         """
         Generates a list of periods based on the given period base list, a maximum number,
         and a minimum fraction threshold for the smallest fractional period.
@@ -106,7 +113,8 @@ class FNE(nn.Module):
         Use precomputed frequencies to turn numbers into cos/sin embeddings.
         """
         # Ensure numbers are on the correct device and in torch.float64
-        numbers = numbers.to(self.device, dtype=torch.float64)*(10**len_gen)
+        device = self.frequencies.device
+        numbers = numbers.to(device=device, dtype=torch.float64) * (10**len_gen)
         # Calculate cos and sin values with broadcasting
         cos_values = torch.cos(numbers.unsqueeze(1) * self.frequencies)
         sin_values = torch.sin(numbers.unsqueeze(1) * self.frequencies)
@@ -118,7 +126,7 @@ class FNE(nn.Module):
         cos_sin_interleaved = cos_sin_stacked.view(cos_values.size(0), -1)
 
         # Initialize the result tensor and populate it
-        result = torch.zeros((len(numbers), self.embedding_dim), dtype=torch.float32, device=self.device)
+        result = torch.zeros((len(numbers), self.embedding_dim), dtype=torch.float32, device=device)
         result[:, :cos_sin_interleaved.shape[1]] = cos_sin_interleaved
 
         return result
@@ -215,6 +223,8 @@ class FNE(nn.Module):
             predicted_number += predicted_digit * (10 ** j)
         
         return predicted_number
+    
+    
 import torch.optim as optim
 
 def main():
