@@ -24,7 +24,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import draccus
 import torch
@@ -92,6 +92,9 @@ class FinetuneHDF5Config:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_lwe_decoder: bool = False                    # If True, enable logit-weighted expectation decoder
+    lwe_temperature: float = 1.0                     # Softmax temperature for LWE decoder
+    lwe_loss_weight: float = 1.0                     # Weight for LWE auxiliary loss
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device
@@ -280,6 +283,13 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    if cfg.use_lwe_decoder and cfg.lwe_temperature <= 0:
+        raise ValueError("`lwe_temperature` must be positive when LWE decoder is enabled.")
+    if cfg.use_lwe_decoder and cfg.lwe_loss_weight < 0:
+        raise ValueError("`lwe_loss_weight` must be non-negative.")
+    vla.config.use_lwe_decoder = cfg.use_lwe_decoder
+    vla.config.lwe_temperature = cfg.lwe_temperature
+    vla.config.lwe_loss_weight = cfg.lwe_loss_weight
 
     # Set number of images in input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -419,6 +429,14 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if cfg.use_lwe_decoder and not (cfg.use_l1_regression or cfg.use_diffusion):
+        recent_metrics.update(
+            {
+                "lwe_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+            }
+        )
 
     # Start training
     print(f"Starting training for {cfg.max_steps} steps...")
@@ -522,4 +540,3 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
 
 if __name__ == "__main__":
     finetune_hdf5()
-

@@ -29,7 +29,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import draccus
 import torch
@@ -107,6 +107,9 @@ class FinetunePlaceShoeConfig:
     use_film: bool = False                                                # Use FiLM for language conditioning
     num_images_in_input: int = 2                                          # Number of images (1: primary only, 2: primary + wrist)
     use_proprio: bool = False                                             # Use proprioceptive state (not available in this dataset)
+    use_lwe_decoder: bool = False                                         # Enable logit-weighted expectation decoder
+    lwe_temperature: float = 1.0                                          # Softmax temperature for LWE decoder
+    lwe_loss_weight: float = 1.0                                          # Weight for LWE auxiliary loss
 
     # Training configuration
     batch_size: int = 4                                                   # Batch size per device
@@ -217,6 +220,8 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
     """Fine-tune OpenVLA on place shoe dataset."""
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), "Cannot do both L1 regression and diffusion!"
+    if cfg.use_lwe_decoder and (cfg.use_l1_regression or cfg.use_diffusion):
+        raise ValueError("LWE decoder is only supported when regression and diffusion heads are disabled.")
 
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA on place shoe dataset")
@@ -266,6 +271,13 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
     ).to(device_id)
+    if cfg.use_lwe_decoder and cfg.lwe_temperature <= 0:
+        raise ValueError("`lwe_temperature` must be positive when LWE decoder is enabled.")
+    if cfg.use_lwe_decoder and cfg.lwe_loss_weight < 0:
+        raise ValueError("`lwe_loss_weight` must be non-negative.")
+    vla.config.use_lwe_decoder = cfg.use_lwe_decoder
+    vla.config.lwe_temperature = cfg.lwe_temperature
+    vla.config.lwe_loss_weight = cfg.lwe_loss_weight
 
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
@@ -293,22 +305,24 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
-    # Initialize action head
-    action_head = init_module(
-        L1RegressionActionHead,
-        "action_head",
-        cfg,
-        device_id,
-        {
-            "input_dim": vla.module.llm_dim,
-            "hidden_dim": vla.module.llm_dim,
-            "action_dim": cfg.action_dim,
-            "loss_type": cfg.regression_loss_type,
-            "huber_delta": cfg.huber_delta,
-        },
-        to_bf16=True,
-    )
-    print(f"Using regression loss type: {cfg.regression_loss_type}")
+    # Initialize action head if needed
+    action_head = None
+    if cfg.use_l1_regression:
+        action_head = init_module(
+            L1RegressionActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": cfg.action_dim,
+                "loss_type": cfg.regression_loss_type,
+                "huber_delta": cfg.huber_delta,
+            },
+            to_bf16=True,
+        )
+        print(f"Using regression loss type: {cfg.regression_loss_type}")
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
@@ -350,7 +364,8 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
 
     # Instantiate optimizer
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
-    trainable_params += [p for p in action_head.parameters() if p.requires_grad]
+    if action_head is not None:
+        trainable_params += [p for p in action_head.parameters() if p.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -363,6 +378,14 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if cfg.use_lwe_decoder:
+        recent_metrics.update(
+            {
+                "lwe_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+            }
+        )
 
     # Start training
     print(f"Starting training for {cfg.max_steps} steps...")
@@ -378,7 +401,7 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
             for batch_idx, batch in enumerate(dataloader):
                 loss, metrics = run_forward_pass(
                     vla=vla,
-                    action_head=action_head,
+                    action_head=action_head if cfg.use_l1_regression else None,
                     noisy_action_projector=None,
                     proprio_projector=None,
                     batch=batch,
@@ -448,4 +471,3 @@ def finetune_place_shoe(cfg: FinetunePlaceShoeConfig) -> None:
 
 if __name__ == "__main__":
     finetune_place_shoe()
-

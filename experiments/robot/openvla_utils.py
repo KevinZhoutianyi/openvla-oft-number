@@ -288,6 +288,9 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    vla.config.use_lwe_decoder = getattr(cfg, "use_lwe_decoder", False)
+    vla.config.lwe_temperature = getattr(cfg, "lwe_temperature", 1.0)
+    vla.config.lwe_loss_weight = getattr(cfg, "lwe_loss_weight", 1.0)
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:

@@ -16,6 +16,7 @@ import timm
 import tokenizers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
@@ -725,11 +726,19 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.norm_stats = config.norm_stats
 
         # Compute action bins
+        if config.n_action_bins <= 0:
+            raise ValueError("`n_action_bins` must be positive to build action bins.")
         self.bins = np.linspace(-1, 1, config.n_action_bins)
         self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
+        bin_centers_tensor = torch.from_numpy(self.bin_centers.copy()).float()
+        self.register_buffer("bin_centers_tensor", bin_centers_tensor, persistent=False)
 
         # Compute vocab size for de-tokenization -- revert added "multiple of"
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
+        if self.vocab_size < self.config.n_action_bins:
+            raise ValueError(
+                "Language model vocab size is smaller than number of action bins; cannot build LWE decoder."
+            )
 
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
@@ -768,6 +777,53 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         labels[:, -1] = STOP_INDEX
 
         return labels
+
+    def _action_vocab_slice(self) -> slice:
+        start = self.vocab_size - self.config.n_action_bins
+        if start < 0:
+            raise ValueError("Number of action bins exceeds language model vocabulary size.")
+        return slice(start, self.vocab_size)
+
+    def compute_lwe_expectation_from_action_logits(
+        self,
+        action_logits: torch.Tensor,
+        temperature: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Compute logit-weighted expectation over action bins.
+
+        Args:
+            action_logits: Tensor of shape [..., vocab] or [..., n_bins] containing logits for action tokens.
+            temperature: Optional override for softmax temperature.
+
+        Returns:
+            Tensor of shape [...,] with expectation values in normalized action space.
+        """
+        if action_logits.ndim < 2:
+            raise ValueError("`action_logits` must have at least 2 dimensions (tokens, vocab).")
+
+        # Determine whether logits include the full vocabulary or are already sliced to bins
+        if action_logits.shape[-1] == self.vocab_size:
+            action_logits = action_logits[..., self._action_vocab_slice()]
+        elif action_logits.shape[-1] != self.config.n_action_bins:
+            raise ValueError(
+                "`action_logits` last dimension must match vocab size or number of action bins for LWE decoding."
+            )
+
+        if action_logits.shape[-1] != self.config.n_action_bins:
+            raise RuntimeError("Mismatch between action logits and configured number of action bins.")
+
+        temp = float(self.config.lwe_temperature if temperature is None else temperature)
+        if temp <= 0:
+            raise ValueError("LWE temperature must be positive.")
+        safe_temp = max(temp, 1e-6)
+
+        scaled_logits = action_logits / safe_temp
+        scaled_logits = torch.nan_to_num(scaled_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = torch.softmax(scaled_logits, dim=-1)
+
+        bin_centers = self.bin_centers_tensor.to(probs.device, dtype=probs.dtype)
+        expectation = torch.matmul(probs, bin_centers.unsqueeze(-1)).squeeze(-1)
+        return expectation
 
     def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
         """Unnormalize actions using dataset statistics"""
@@ -917,12 +973,24 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             :,
         ]  # (B, act_chunk_len, D)
 
+        use_lwe_decoder = getattr(self.config, "use_lwe_decoder", False) and action_head is None
+
         # Handle different prediction methods
         if action_head is not None:
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
+        elif use_lwe_decoder:
+            action_start = NUM_PATCHES + NUM_PROMPT_TOKENS
+            action_end = action_start + ACTION_DIM * NUM_ACTIONS_CHUNK
+            expectation = self.compute_lwe_expectation_from_action_logits(
+                language_model_output.logits[:, action_start:action_end, :]
+            )
+            expectation = expectation.reshape(language_model_output.logits.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized_actions = expectation.float().cpu().detach().numpy()
+            if normalized_actions.shape[0] == 1:
+                normalized_actions = normalized_actions[0]
         else:
             # Discrete token-based prediction
             predicted_action_token_ids = (

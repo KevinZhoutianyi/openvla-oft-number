@@ -128,6 +128,9 @@ class DeployConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    use_lwe_decoder: bool = False                    # Enable logit-weighted expectation decoder
+    lwe_temperature: float = 1.0                     # Softmax temperature for LWE decoder
+    lwe_loss_weight: float = 1.0                     # Weight for LWE auxiliary loss (used during training)
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 

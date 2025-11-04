@@ -46,6 +46,8 @@ class EvalConfig:
     use_lora: bool = True                                    # Whether the checkpoint uses LoRA
     batch_size: int = 4                                      # Batch size for evaluation
     num_images_in_input: int = 1                             # Number of images (1: primary only, 2: primary + wrist)
+    use_lwe_decoder: bool = False                            # Enable logit-weighted expectation decoder
+    lwe_temperature: float = 1.0                             # Softmax temperature for LWE decoder
     
     # Output
     output_file: Optional[str] = None                        # Where to save results (default: checkpoint_dir/eval_results.json)
@@ -110,6 +112,10 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     print(f"Loading processor from openvla/openvla-7b...")
     processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
     
+    # Validate LWE settings
+    if cfg.use_lwe_decoder and cfg.lwe_temperature <= 0:
+        raise ValueError("`lwe_temperature` must be positive when LWE decoder is enabled.")
+
     # Load model from checkpoint
     print(f"Loading model from checkpoint: {cfg.checkpoint_dir}")
     if cfg.use_lora:
@@ -137,8 +143,24 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
             trust_remote_code=True,
         )
     
+    target_models = [model]
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        target_models.append(model.base_model.model)
+    for target in target_models:
+        if hasattr(target, "config"):
+            target.config.use_lwe_decoder = cfg.use_lwe_decoder
+            target.config.lwe_temperature = cfg.lwe_temperature
+            if not hasattr(target.config, "lwe_loss_weight"):
+                target.config.lwe_loss_weight = 1.0
+
     model = model.to(f"cuda:{rank}")
     model.eval()
+
+    base_model = model
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        base_model = model.base_model.model
+
+    num_patches = base_model.vision_backbone.get_num_patches() * base_model.vision_backbone.get_num_images_in_input()
     
     # Load action tokenizer
     from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -183,6 +205,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     total_loss = 0.0
     total_action_accuracy = 0.0
     total_l1_loss = 0.0
+    total_lwe_l1_loss = 0.0
     total_steps = 0
     
     # Track per-dimension errors
@@ -237,32 +260,43 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 mask=current_action_mask
             )
             
-            # Compute L1 loss
-            # Extract only the action tokens
-            pred_action_tokens = predicted_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
-            gt_action_tokens = ground_truth_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
-            
-            # Convert to continuous actions
-            for i in range(pred_action_tokens.shape[0]):
-                pred_actions = action_tokenizer.decode_token_ids_to_actions(pred_action_tokens[i].cpu().numpy())
-                gt_actions = action_tokenizer.decode_token_ids_to_actions(gt_action_tokens[i].cpu().numpy())
-                
-                # Track per-dimension errors
-                for dim in range(ACTION_DIM):
-                    per_dim_errors[dim].append(abs(pred_actions[dim] - gt_actions[dim]))
-            
-            # Compute L1 loss for this batch
-            l1_loss = compute_actions_l1_loss(
-                action_tokenizer,
-                predicted_token_ids[current_action_mask],
-                ground_truth_token_ids[current_action_mask],
-                current_action_mask[current_action_mask],
-            )
+            # Compute L1 loss / per-dimension errors
+            if cfg.use_lwe_decoder and ground_truth_actions is not None:
+                action_logits = logits[:, num_patches:-1, :]
+                lwe_expectation = base_model.compute_lwe_expectation_from_action_logits(action_logits)
+                lwe_expectation = lwe_expectation.view_as(ground_truth_actions).to(ground_truth_actions.dtype)
+                lwe_l1_value = torch.nn.functional.l1_loss(lwe_expectation, ground_truth_actions, reduction="mean").item()
+                total_lwe_l1_loss += lwe_l1_value
+                batch_l1_value = lwe_l1_value
+
+                flat_pred = lwe_expectation.view(-1, ACTION_DIM).cpu().numpy()
+                flat_gt = ground_truth_actions.view(-1, ACTION_DIM).cpu().numpy()
+                for row_pred, row_gt in zip(flat_pred, flat_gt):
+                    for dim in range(ACTION_DIM):
+                        per_dim_errors[dim].append(abs(row_pred[dim] - row_gt[dim]))
+            else:
+                pred_action_tokens = predicted_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
+                gt_action_tokens = ground_truth_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
+
+                for i in range(pred_action_tokens.shape[0]):
+                    pred_actions = action_tokenizer.decode_token_ids_to_actions(pred_action_tokens[i].cpu().numpy())
+                    gt_actions = action_tokenizer.decode_token_ids_to_actions(gt_action_tokens[i].cpu().numpy())
+
+                    for dim in range(ACTION_DIM):
+                        per_dim_errors[dim].append(abs(pred_actions[dim] - gt_actions[dim]))
+
+                l1_loss = compute_actions_l1_loss(
+                    action_tokenizer,
+                    predicted_token_ids[current_action_mask],
+                    ground_truth_token_ids[current_action_mask],
+                    current_action_mask[current_action_mask],
+                )
+                batch_l1_value = l1_loss.item()
             
             # Accumulate metrics
             total_loss += loss.item()
             total_action_accuracy += action_accuracy.item()
-            total_l1_loss += l1_loss.item()
+            total_l1_loss += batch_l1_value
             total_steps += 1
             
             # Print progress every 10 batches
@@ -270,23 +304,32 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 print(f"[{batch_idx + 1}/{len(dataloader)}] "
                       f"Loss: {loss.item():.4f}, "
                       f"Action Acc: {action_accuracy.item():.4f}, "
-                      f"L1 Loss: {l1_loss.item():.4f}")
+                      f"L1 Loss: {batch_l1_value:.4f}")
     
     # Compute final metrics
     avg_loss = total_loss / total_steps
     avg_action_accuracy = total_action_accuracy / total_steps
     avg_l1_loss = total_l1_loss / total_steps
+    avg_lwe_l1_loss = total_lwe_l1_loss / total_steps if cfg.use_lwe_decoder else None
     
     # Compute per-dimension statistics
     per_dim_stats = {}
     for dim in range(ACTION_DIM):
-        errors = per_dim_errors[dim]
-        per_dim_stats[f"dim_{dim}"] = {
-            "mean_abs_error": float(np.mean(errors)),
-            "std_abs_error": float(np.std(errors)),
-            "median_abs_error": float(np.median(errors)),
-            "max_abs_error": float(np.max(errors)),
-        }
+        errors = np.asarray(per_dim_errors[dim], dtype=np.float32)
+        if errors.size == 0:
+            per_dim_stats[f"dim_{dim}"] = {
+                "mean_abs_error": 0.0,
+                "std_abs_error": 0.0,
+                "median_abs_error": 0.0,
+                "max_abs_error": 0.0,
+            }
+        else:
+            per_dim_stats[f"dim_{dim}"] = {
+                "mean_abs_error": float(np.mean(errors)),
+                "std_abs_error": float(np.std(errors)),
+                "median_abs_error": float(np.median(errors)),
+                "max_abs_error": float(np.max(errors)),
+            }
     
     # Print results
     print(f"\n{'='*80}")
@@ -296,6 +339,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     print(f"Average Loss: {avg_loss:.6f}")
     print(f"Average Action Token Accuracy: {avg_action_accuracy:.6f} ({avg_action_accuracy*100:.2f}%)")
     print(f"Average L1 Loss (Continuous Actions): {avg_l1_loss:.6f}")
+    if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
+        print(f"Average LWE L1 Loss: {avg_lwe_l1_loss:.6f}")
     print(f"\nPer-Dimension Mean Absolute Errors:")
     for dim in range(ACTION_DIM):
         print(f"  Dim {dim:2d}: {per_dim_stats[f'dim_{dim}']['mean_abs_error']:.6f} "
@@ -314,6 +359,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
         "avg_l1_loss": avg_l1_loss,
         "per_dimension_stats": per_dim_stats,
     }
+    if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
+        results["avg_lwe_l1_loss"] = avg_lwe_l1_loss
     
     if rank == 0:
         with open(output_file, "w") as f:
@@ -326,4 +373,3 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
 
 if __name__ == "__main__":
     eval_place_shoe()
-

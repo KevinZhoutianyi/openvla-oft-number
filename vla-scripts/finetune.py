@@ -15,6 +15,7 @@ import draccus
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import tqdm
 from accelerate import PartialState
 from huggingface_hub import HfApi, snapshot_download
@@ -83,6 +84,9 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_lwe_decoder: bool = False                    # If True, enable logit-weighted expectation decoder
+    lwe_temperature: float = 1.0                     # Softmax temperature for LWE decoder
+    lwe_loss_weight: float = 1.0                     # Weight for LWE auxiliary loss (L1)
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -307,7 +311,10 @@ def run_forward_pass(
             loss: The loss tensor with gradient for backpropagation.
             metrics_dict: Dictionary of computed metrics (detached values for logging).
     """
-    metrics = {}
+    metrics: Dict[str, float] = {}
+    base_vla = vla.module if hasattr(vla, "module") else vla
+    use_lwe_decoder = getattr(base_vla.config, "use_lwe_decoder", False) and not (use_l1_regression or use_diffusion)
+    lwe_loss_weight = float(getattr(base_vla.config, "lwe_loss_weight", 1.0)) if use_lwe_decoder else 0.0
 
     # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
@@ -369,6 +376,24 @@ def run_forward_pass(
                 "next_actions_l1_loss": next_actions_l1_loss.item(),
             }
         )
+
+        if use_lwe_decoder:
+            action_logits = output.logits[:, num_patches:-1, :]
+            lwe_expectation = base_vla.compute_lwe_expectation_from_action_logits(action_logits)
+            lwe_expectation = lwe_expectation.view_as(ground_truth_actions).to(ground_truth_actions.dtype)
+            lwe_loss = F.l1_loss(lwe_expectation, ground_truth_actions, reduction="mean")
+            if lwe_loss_weight > 0.0:
+                loss = loss + lwe_loss_weight * lwe_loss
+            metrics["lwe_loss"] = lwe_loss.item()
+            curr_lwe = F.l1_loss(
+                lwe_expectation[:, 0], ground_truth_actions[:, 0], reduction="mean"
+            )
+            next_lwe = F.l1_loss(
+                lwe_expectation[:, 1:], ground_truth_actions[:, 1:], reduction="mean"
+            )
+            metrics["lwe_curr_action_l1_loss"] = curr_lwe.item()
+            metrics["lwe_next_actions_l1_loss"] = next_lwe.item()
+            metrics["loss_value"] = loss.item()
     # Compute metrics for continuous action representations (L1 regression | diffusion)
     else:
         # Get last layer hidden states
@@ -838,6 +863,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    if cfg.use_lwe_decoder and cfg.lwe_temperature <= 0:
+        raise ValueError("`lwe_temperature` must be positive when LWE decoder is enabled.")
+    if cfg.use_lwe_decoder and cfg.lwe_loss_weight < 0:
+        raise ValueError("`lwe_loss_weight` must be non-negative.")
+    vla.config.use_lwe_decoder = cfg.use_lwe_decoder
+    vla.config.lwe_temperature = cfg.lwe_temperature
+    vla.config.lwe_loss_weight = cfg.lwe_loss_weight
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1027,6 +1059,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if cfg.use_lwe_decoder and not (cfg.use_l1_regression or cfg.use_diffusion):
+        recent_metrics.update(
+            {
+                "lwe_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "lwe_next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+            }
+        )
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:

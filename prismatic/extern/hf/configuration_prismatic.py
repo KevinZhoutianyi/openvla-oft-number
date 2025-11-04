@@ -133,8 +133,21 @@ class OpenVLAConfig(PrismaticConfig):
         self,
         norm_stats: Optional[Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]]] = None,
         n_action_bins: int = 256,
+        use_lwe_decoder: bool = False,
+        lwe_temperature: float = 1.0,
+        lwe_loss_weight: float = 1.0,
         **kwargs: str,
     ) -> None:
+        if n_action_bins <= 0:
+            raise ValueError("`n_action_bins` must be positive.")
+        if lwe_temperature <= 0:
+            raise ValueError("`lwe_temperature` must be positive for LWE decoder stability.")
+        if lwe_loss_weight < 0:
+            raise ValueError("`lwe_loss_weight` must be non-negative.")
+
         self.norm_stats, self.n_action_bins = norm_stats, n_action_bins
+        self.use_lwe_decoder = use_lwe_decoder
+        self.lwe_temperature = float(lwe_temperature)
+        self.lwe_loss_weight = float(lwe_loss_weight)
 
         super().__init__(**kwargs)
