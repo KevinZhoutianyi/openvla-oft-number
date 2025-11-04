@@ -16,7 +16,7 @@ import numpy as np
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import draccus
 import torch
@@ -128,6 +128,12 @@ class DeployConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    use_fone_for_proprio: bool = False               # If True, replace MLP proprio projector with FoNE
+    fone_per_scalar_tokens: bool = True              # Emit one token per scalar when FoNE is enabled
+    fone_hidden: int = 256                           # FoNE hidden width before projection to LLM space
+    fone_int_digits: int = 5                         # Max integer digits encoded by FoNE
+    fone_frac_digits: int = 5                        # Max fractional digits encoded by FoNE
+    fone_period_bases: Tuple[int, ...] = (2, 5)      # Period bases for FoNE Fourier features
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 

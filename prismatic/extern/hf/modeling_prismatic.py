@@ -20,6 +20,7 @@ import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+from prismatic.vla.module import FoNEProjector
 
 from prismatic.training.train_utils import (
     get_current_action_mask,
@@ -358,6 +359,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
+        self._default_proprio_projector: Optional[nn.Module] = None
 
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
@@ -446,17 +448,45 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # Project patch embeddings into language embedding space
         return self.projector(patch_features)
 
+    # def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
+    #     """Process proprioceptive features and append to vision features"""
+    #     if proprio_projector is not None and proprio is not None:
+    #         # projected_patch_embeddings: (bsz, num_patches * num_images, llm_dim)
+    #         # proprio: (bsz, proprio_dim) or (propro_dim,)
+    #         proprio = proprio.reshape(projected_patch_embeddings.shape[0], -1)  # (bsz, proprio_dim)
+    #         proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
+    #         proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
+    #         # For simplicity, just append proprio token to the end of projected vision patch tokens
+    #         return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
+    #     return projected_patch_embeddings
+    
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
-        """Process proprioceptive features and append to vision features"""
-        if proprio_projector is not None and proprio is not None:
-            # projected_patch_embeddings: (bsz, num_patches * num_images, llm_dim)
-            # proprio: (bsz, proprio_dim) or (propro_dim,)
-            proprio = proprio.reshape(projected_patch_embeddings.shape[0], -1)  # (bsz, proprio_dim)
-            proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
-            proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
-            # For simplicity, just append proprio token to the end of projected vision patch tokens
-            return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
-        return projected_patch_embeddings
+        """
+        Append proprio tokens after vision tokens.
+
+        Inputs:
+          projected_patch_embeddings: [B, V, D]
+          proprio: [B, P] robot state (floats; raw units preferred for FoNE)
+          proprio_projector: module mapping [B, P] -> [B, D] or [B, T_prop, D]
+
+        Returns:
+          [B, V + T_prop, D]
+        """
+        if proprio_projector is None or proprio is None:
+            return projected_patch_embeddings
+
+        B = projected_patch_embeddings.shape[0]
+        proprio = proprio.reshape(B, -1)                # [B, P]
+        proprio_features = proprio_projector(proprio)   # [B, D] or [B, T_prop, D]
+
+        if proprio_features.dim() == 2:
+            proprio_features = proprio_features.unsqueeze(1)  # -> [B, 1, D]
+        elif proprio_features.dim() != 3:
+            raise ValueError("proprio_projector must return [B, D] or [B, T_prop, D]")
+
+        proprio_features = proprio_features.to(projected_patch_embeddings.dtype)
+
+        return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
 
     def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
         """Build multimodal embeddings and attention mask"""
@@ -584,11 +614,37 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            assert projected_patch_embeddings.dim() == 3, "Expected [B, V, D] from vision projector"
 
+            if (
+                proprio is not None
+                and proprio_projector is None
+                and getattr(self.config, "use_fone_for_proprio", False)
+            ):
+                with torch.no_grad():
+                    proprio_dim = int(torch.as_tensor(proprio).shape[-1])
+                needs_init = self._default_proprio_projector is None
+                if not needs_init:
+                    cached_dim = getattr(self._default_proprio_projector, "proprio_dim", None)
+                    needs_init = cached_dim != proprio_dim
+                if needs_init:
+                    llm_dim = int(self.config.text_config.hidden_size)
+                    self._default_proprio_projector = FoNEProjector(
+                        proprio_dim=proprio_dim,
+                        llm_dim=llm_dim,
+                        per_scalar_tokens=getattr(self.config, "fone_per_scalar", True),
+                        fone_hidden=getattr(self.config, "fone_hidden", 256),
+                        int_digits=getattr(self.config, "fone_int_digits", 5),
+                        frac_digits=getattr(self.config, "fone_frac_digits", 5),
+                        period_bases=tuple(getattr(self.config, "fone_bases", (2, 5))),
+                    ).to(projected_patch_embeddings.device)
+                proprio_projector = self._default_proprio_projector
+            
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
             )
+            assert projected_patch_embeddings.dim() == 3, "Expected [B, V+T_prop, D] after proprio append"
 
             # [Diffusion] Add diffusion timestep embedding if provided
             if diffusion_timestep_embeddings is not None:
@@ -730,6 +786,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Compute vocab size for de-tokenization -- revert added "multiple of"
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
+        self._default_proprio_projector = None
 
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
@@ -1001,6 +1058,29 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        if (
+            proprio is not None
+            and proprio_projector is None
+            and getattr(self.config, "use_fone_for_proprio", False)
+        ):
+            with torch.no_grad():
+                proprio_dim = int(torch.as_tensor(proprio).shape[-1])
+            needs_init = self._default_proprio_projector is None
+            if not needs_init:
+                cached_dim = getattr(self._default_proprio_projector, "proprio_dim", None)
+                needs_init = cached_dim != proprio_dim
+            if needs_init:
+                llm_dim = int(self.config.text_config.hidden_size)
+                self._default_proprio_projector = FoNEProjector(
+                    proprio_dim=proprio_dim,
+                    llm_dim=llm_dim,
+                    per_scalar_tokens=getattr(self.config, "fone_per_scalar", True),
+                    fone_hidden=getattr(self.config, "fone_hidden", 256),
+                    int_digits=getattr(self.config, "fone_int_digits", 5),
+                    frac_digits=getattr(self.config, "fone_frac_digits", 5),
+                    period_bases=tuple(getattr(self.config, "fone_bases", (2, 5))),
+                ).to(input_embeddings.device)
+            proprio_projector = self._default_proprio_projector
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1013,12 +1093,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
-        # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
-        if use_proprio:
-            NUM_PATCHES += 1
-        if use_diffusion:
-            NUM_PATCHES += 1
+        # Calculate number of patch tokens (vision + optional proprio) and account for diffusion token if present
+        num_patch_tokens = projected_patch_embeddings.shape[1]
+        NUM_PATCHES = num_patch_tokens + (1 if use_diffusion else 0)
 
         if use_diffusion:
             # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion

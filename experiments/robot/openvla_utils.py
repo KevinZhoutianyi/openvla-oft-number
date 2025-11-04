@@ -27,6 +27,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.vla.module import FoNEProjector
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -288,6 +289,12 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    vla.config.use_fone_for_proprio = getattr(cfg, "use_fone_for_proprio", False)
+    vla.config.fone_per_scalar = getattr(cfg, "fone_per_scalar_tokens", True)
+    vla.config.fone_hidden = getattr(cfg, "fone_hidden", 256)
+    vla.config.fone_int_digits = getattr(cfg, "fone_int_digits", 5)
+    vla.config.fone_frac_digits = getattr(cfg, "fone_frac_digits", 5)
+    vla.config.fone_bases = tuple(getattr(cfg, "fone_period_bases", (2, 5)))
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
@@ -390,7 +397,7 @@ def get_processor(cfg: Any) -> AutoProcessor:
     return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
 
 
-def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioProjector:
+def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> torch.nn.Module:
     """
     Get proprioception projector for the VLA model.
 
@@ -400,14 +407,23 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
         proprio_dim: Dimension of proprioception data
 
     Returns:
-        ProprioProjector: The initialized proprio projector
+        torch.nn.Module: The initialized proprio projector
     """
-    # Initialize projector and move to device
-    proprio_projector = ProprioProjector(
-        llm_dim=llm_dim,
-        proprio_dim=proprio_dim,
-    ).to(DEVICE)
-    proprio_projector = proprio_projector.to(torch.bfloat16).to(DEVICE)
+    if getattr(cfg, "use_fone_for_proprio", False):
+        proprio_projector = FoNEProjector(
+            proprio_dim=proprio_dim,
+            llm_dim=llm_dim,
+            per_scalar_tokens=getattr(cfg, "fone_per_scalar_tokens", True),
+            fone_hidden=getattr(cfg, "fone_hidden", 256),
+            int_digits=getattr(cfg, "fone_int_digits", 5),
+            frac_digits=getattr(cfg, "fone_frac_digits", 5),
+            period_bases=tuple(getattr(cfg, "fone_period_bases", (2, 5))),
+        ).to(DEVICE)
+    else:
+        proprio_projector = ProprioProjector(
+            llm_dim=llm_dim,
+            proprio_dim=proprio_dim,
+        ).to(torch.bfloat16).to(DEVICE)
     proprio_projector.eval()
 
     # Find and load checkpoint (may be on Hugging Face Hub or stored locally)

@@ -5,7 +5,7 @@ HuggingFace-style configuration definition for Prismatic VLMs, inheriting from `
 Default configuration specifies `siglip-224px+7b`.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
@@ -85,6 +85,12 @@ class PrismaticConfig(PretrainedConfig):
         pad_token_id: int = 32000,
         pad_to_multiple_of: int = 64,
         output_projector_states: bool = False,
+        use_fone_for_proprio: bool = False,  # enable FoNE-based proprio projector
+        fone_per_scalar: bool = True,        # emit one token per scalar feature
+        fone_hidden: int = 256,              # FoNE hidden width before LLM projection
+        fone_int_digits: int = 5,            # max integer digits
+        fone_frac_digits: int = 5,           # max fractional digits
+        fone_bases: Tuple[int, int] = (2, 5),  # Fourier base periods
         **kwargs: str,
     ) -> None:
         if vision_backbone_id not in VALID_VISION_BACKBONES:
@@ -121,6 +127,12 @@ class PrismaticConfig(PretrainedConfig):
             if text_config is not None
             else CONFIG_MAPPING[LLM_BACKBONE_TO_HF_METACLASS[self.llm_backbone_id]]()
         )
+        self.use_fone_for_proprio = use_fone_for_proprio
+        self.fone_per_scalar = fone_per_scalar
+        self.fone_hidden = fone_hidden
+        self.fone_int_digits = fone_int_digits
+        self.fone_frac_digits = fone_frac_digits
+        self.fone_bases = fone_bases
 
         # Dispatch **kwargs to super() =>> note that `pad_token_id` collides, so we pass it in here as well...
         super().__init__(pad_token_id=pad_token_id, **kwargs)

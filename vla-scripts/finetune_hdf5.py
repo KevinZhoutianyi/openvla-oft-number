@@ -24,7 +24,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import draccus
 import torch
@@ -53,6 +53,7 @@ from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActio
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.vla.module import FoNEProjector
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, PROPRIO_DIM
@@ -92,6 +93,12 @@ class FinetuneHDF5Config:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_fone_for_proprio: bool = False               # If True, replace MLP proprio projector with FoNE
+    fone_per_scalar_tokens: bool = True              # Emit one token per scalar when FoNE is enabled
+    fone_hidden: int = 256                           # FoNE hidden width before projection to LLM space
+    fone_int_digits: int = 5                         # Max integer digits encoded by FoNE
+    fone_frac_digits: int = 5                        # Max fractional digits encoded by FoNE
+    fone_period_bases: Tuple[int, ...] = (2, 5)      # Period bases for FoNE Fourier features
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device
@@ -280,6 +287,12 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    vla.config.use_fone_for_proprio = cfg.use_fone_for_proprio
+    vla.config.fone_per_scalar = cfg.fone_per_scalar_tokens
+    vla.config.fone_hidden = cfg.fone_hidden
+    vla.config.fone_int_digits = cfg.fone_int_digits
+    vla.config.fone_frac_digits = cfg.fone_frac_digits
+    vla.config.fone_bases = tuple(cfg.fone_period_bases)
 
     # Set number of images in input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -311,13 +324,30 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
 
     # Initialize proprio projector if needed
     if cfg.use_proprio:
-        proprio_projector = init_module(
-            ProprioProjector,
-            "proprio_projector",
-            cfg,
-            device_id,
-            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
-        )
+        if cfg.use_fone_for_proprio:
+            proprio_projector = init_module(
+                FoNEProjector,
+                "proprio_projector",
+                cfg,
+                device_id,
+                {
+                    "proprio_dim": PROPRIO_DIM,
+                    "llm_dim": vla.module.llm_dim,
+                    "per_scalar_tokens": cfg.fone_per_scalar_tokens,
+                    "fone_hidden": cfg.fone_hidden,
+                    "int_digits": cfg.fone_int_digits,
+                    "frac_digits": cfg.fone_frac_digits,
+                    "period_bases": tuple(cfg.fone_period_bases),
+                },
+            )
+        else:
+            proprio_projector = init_module(
+                ProprioProjector,
+                "proprio_projector",
+                cfg,
+                device_id,
+                {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            )
 
     # Initialize action head
     if cfg.use_l1_regression:
@@ -351,7 +381,10 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     if cfg.use_proprio:
-        NUM_PATCHES += 1
+        if cfg.use_fone_for_proprio and cfg.fone_per_scalar_tokens:
+            NUM_PATCHES += PROPRIO_DIM
+        else:
+            NUM_PATCHES += 1
     if cfg.use_diffusion:
         NUM_PATCHES += 1
 
@@ -522,4 +555,3 @@ def finetune_hdf5(cfg: FinetuneHDF5Config) -> None:
 
 if __name__ == "__main__":
     finetune_hdf5()
-
