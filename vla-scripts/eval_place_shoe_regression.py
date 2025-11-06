@@ -178,6 +178,8 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
     all_l1_losses = []
     all_predicted_actions = []
     all_ground_truth_actions = []
+    total_successes = 0.0
+    total_success_count = 0
     
     print(f"[Rank {rank}] Starting evaluation on {len(dataloader)} batches...")
     
@@ -193,9 +195,17 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
             
             ground_truth_actions = batch["actions"].to(f"cuda:{rank}")  # (B, chunk_size, action_dim)
             batch_size = ground_truth_actions.shape[0]
-            
+
             # Flatten actions for comparison
             ground_truth_actions_flat = ground_truth_actions.reshape(batch_size, -1)  # (B, chunk*action_dim)
+
+            success_batch = batch.get("success")
+            if success_batch is not None:
+                success_batch = success_batch.to(torch.float32)
+                valid_mask = ~torch.isnan(success_batch)
+                if valid_mask.any():
+                    total_successes += success_batch[valid_mask].sum().item()
+                    total_success_count += int(valid_mask.sum().item())
             
             # Forward pass to get hidden states
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -269,6 +279,7 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
     
     # Aggregate results
     avg_l1_loss = np.mean(all_l1_losses)
+    success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
     
     # Compute per-dimension errors
     all_predicted_actions = torch.cat(all_predicted_actions, dim=0)
@@ -284,6 +295,7 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         'num_batches': len(dataloader),
         'batch_size': cfg.batch_size,
         'per_dimension_stats': per_dim_stats,
+        'success_rate': float(success_rate) if success_rate is not None else None,
     }
     
     if rank == 0:
@@ -292,6 +304,8 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         print("="*80)
         print(f"Average L1 Loss: {avg_l1_loss:.6f}")
         print(f"Number of batches: {len(dataloader)}")
+        if success_rate is not None:
+            print(f"Success Rate: {success_rate:.6f} ({success_rate * 100:.2f}%)")
         
         print("\nPer-Dimension Errors:")
         for dim in range(cfg.action_dim):
@@ -316,4 +330,3 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
 
 if __name__ == "__main__":
     eval_place_shoe_regression()
-

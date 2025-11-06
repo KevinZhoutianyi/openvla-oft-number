@@ -15,6 +15,7 @@ This dataset has a specific structure:
 """
 
 import h5py
+import numbers
 import numpy as np
 import torch
 from pathlib import Path
@@ -88,6 +89,8 @@ class PlaceShoeDataset(Dataset):
             "left_wrist": "left_wrist_image",
             "right_wrist": "right_wrist_image",
         }
+        self._success_keys = ("success", "successes", "episode_success", "rollout_success", "task_success")
+        self.has_success = False
         
         # Load all episodes and build index
         self.episodes = []
@@ -117,6 +120,75 @@ class PlaceShoeDataset(Dataset):
         
         print(f"Loaded {len(self.episodes)} transitions from {len(hdf5_files) if self.hdf5_path.is_dir() else 1} HDF5 file(s)")
     
+    def _normalize_success_value(self, value: Any) -> Optional[float]:
+        """Convert various success annotations to float in [0, 1]."""
+        if value is None:
+            return None
+
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+
+        if isinstance(value, str):
+            value_str = value.strip().lower()
+            if value_str in {"1", "true", "success", "yes", "y"}:
+                return 1.0
+            if value_str in {"0", "false", "failure", "fail", "no", "n"}:
+                return 0.0
+            try:
+                return float(value_str)
+            except ValueError:
+                return None
+
+        if isinstance(value, numbers.Number):
+            return float(value)
+
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            if value.size == 1:
+                return self._normalize_success_value(value.reshape(-1)[0])
+
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return None
+            if len(value) == 1:
+                return self._normalize_success_value(value[0])
+
+        return None
+
+    def _extract_success_series(self, f: h5py.File) -> Optional[Any]:
+        """Read any success annotation stored in the HDF5 file."""
+        for key in self._success_keys:
+            if key in f:
+                try:
+                    return f[key][()]
+                except Exception:
+                    continue
+        for key in self._success_keys:
+            if key in f.attrs:
+                return f.attrs[key]
+        return None
+
+    def _get_success_value_from_series(self, series: Any, timestep: int) -> Optional[float]:
+        """Extract per-sample success value."""
+        if series is None:
+            return None
+
+        if isinstance(series, np.ndarray):
+            if series.ndim == 0:
+                return self._normalize_success_value(series.item())
+            if series.shape[0] > 0:
+                idx = min(timestep, series.shape[0] - 1)
+                return self._normalize_success_value(series[idx])
+
+        if isinstance(series, (list, tuple)):
+            if len(series) == 0:
+                return None
+            idx = min(timestep, len(series) - 1)
+            return self._normalize_success_value(series[idx])
+
+        return self._normalize_success_value(series)
+
     def _load_episodes_from_file(self, file_path: Path) -> None:
         """Load episode metadata from HDF5 file."""
         with h5py.File(file_path, 'r') as f:
@@ -128,13 +200,19 @@ class PlaceShoeDataset(Dataset):
             else:
                 print(f"Warning: Could not find actions in {file_path}")
                 return
+
+            success_series = self._extract_success_series(f)
             
             # Store episode metadata for each timestep
             for t in range(ep_len - NUM_ACTIONS_CHUNK + 1):  # Account for action chunking
+                success_value = self._get_success_value_from_series(success_series, t)
+                if success_value is not None:
+                    self.has_success = True
                 self.episodes.append({
                     'file_path': str(file_path),
                     'timestep': t,
-                    'episode_length': ep_len
+                    'episode_length': ep_len,
+                    'success': success_value,
                 })
     
     def _compute_statistics(self) -> Dict[str, Any]:
@@ -211,7 +289,10 @@ class PlaceShoeDataset(Dataset):
         # Return default instruction if not found
         return self.default_instruction
     
-    def load_episode(self, episode_info: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, str, Optional[np.ndarray], Optional[np.ndarray]]:
+    def load_episode(
+        self,
+        episode_info: Dict[str, Any]
+    ) -> Tuple[np.ndarray, np.ndarray, str, Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
         """
         Load data from HDF5 file for a specific episode and timestep.
         
@@ -221,9 +302,14 @@ class PlaceShoeDataset(Dataset):
             instruction: string
             proprio: None (not available in this dataset)
             wrist_image: (H, W, 3) uint8 array or None
+            success: Optional float in [0, 1]
         """
         with h5py.File(episode_info['file_path'], 'r') as f:
             t = episode_info['timestep']
+            success_value = episode_info.get('success')
+            if success_value is None and self.has_success:
+                success_series = self._extract_success_series(f)
+                success_value = self._get_success_value_from_series(success_series, t)
             
             # Load primary camera image
             camera_key = self.camera_key_map[self.camera_view]
@@ -269,7 +355,7 @@ class PlaceShoeDataset(Dataset):
             # Proprio is not available in this dataset
             proprio = None
         
-        return image, actions, instruction, proprio, wrist_image
+        return image, actions, instruction, proprio, wrist_image, success_value
     
     def __len__(self) -> int:
         return len(self.episodes)
@@ -279,7 +365,7 @@ class PlaceShoeDataset(Dataset):
         episode_info = self.episodes[idx]
         
         # Load data from HDF5
-        image, actions, instruction, proprio, wrist_image = self.load_episode(episode_info)
+        image, actions, instruction, proprio, wrist_image, success_value = self.load_episode(episode_info)
         
         # Convert image to PIL
         if image.dtype != np.uint8:
@@ -328,6 +414,12 @@ class PlaceShoeDataset(Dataset):
                 wrist_image = (wrist_image * 255).astype(np.uint8)
             wrist_image_pil = Image.fromarray(wrist_image)
             return_dict['pixel_values_wrist'] = self.image_transform(wrist_image_pil)
+
+        if self.has_success:
+            success_tensor = torch.tensor(
+                float(success_value) if success_value is not None else float("nan"),
+                dtype=torch.float32,
+            )
+            return_dict['success'] = success_tensor
         
         return return_dict
-
