@@ -143,6 +143,11 @@ class PaddedCollatorForActionPrediction:
         else:
             proprio = None
 
+        if "success" in instances[0]:
+            success = torch.stack([instance["success"].to(torch.float32) for instance in instances])
+        else:
+            success = None
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
@@ -153,4 +158,6 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if success is not None:
+            output["success"] = success
         return output

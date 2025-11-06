@@ -151,3 +151,6 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+# Local inspection scripts
+vla-scripts/inspect_robot_data.py

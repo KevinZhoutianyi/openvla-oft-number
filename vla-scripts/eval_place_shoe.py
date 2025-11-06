@@ -207,6 +207,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     total_l1_loss = 0.0
     total_lwe_l1_loss = 0.0
     total_steps = 0
+    total_successes = 0.0
+    total_success_count = 0
     
     # Track per-dimension errors
     from prismatic.vla.constants import ACTION_DIM
@@ -292,6 +294,15 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                     current_action_mask[current_action_mask],
                 )
                 batch_l1_value = l1_loss.item()
+
+            success_batch = batch.get("success")
+            if success_batch is not None:
+                success_batch = success_batch.to(torch.float32)
+                valid_mask = ~torch.isnan(success_batch)
+                if valid_mask.any():
+                    valid_values = success_batch[valid_mask]
+                    total_successes += valid_values.sum().item()
+                    total_success_count += int(valid_mask.sum().item())
             
             # Accumulate metrics
             total_loss += loss.item()
@@ -311,6 +322,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     avg_action_accuracy = total_action_accuracy / total_steps
     avg_l1_loss = total_l1_loss / total_steps
     avg_lwe_l1_loss = total_lwe_l1_loss / total_steps if cfg.use_lwe_decoder else None
+    success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
     
     # Compute per-dimension statistics
     per_dim_stats = {}
@@ -341,6 +353,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     print(f"Average L1 Loss (Continuous Actions): {avg_l1_loss:.6f}")
     if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
         print(f"Average LWE L1 Loss: {avg_lwe_l1_loss:.6f}")
+    if success_rate is not None:
+        print(f"Success Rate: {success_rate:.6f} ({success_rate * 100:.2f}%)")
     print(f"\nPer-Dimension Mean Absolute Errors:")
     for dim in range(ACTION_DIM):
         print(f"  Dim {dim:2d}: {per_dim_stats[f'dim_{dim}']['mean_abs_error']:.6f} "
@@ -358,6 +372,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
         "avg_action_token_accuracy": avg_action_accuracy,
         "avg_l1_loss": avg_l1_loss,
         "per_dimension_stats": per_dim_stats,
+        "success_rate": success_rate,
     }
     if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
         results["avg_lwe_l1_loss"] = avg_lwe_l1_loss
