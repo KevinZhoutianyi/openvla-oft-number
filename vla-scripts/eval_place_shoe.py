@@ -51,6 +51,7 @@ class EvalConfig:
     
     # Output
     output_file: Optional[str] = None                        # Where to save results (default: checkpoint_dir/eval_results.json)
+    success_threshold: float = 0.05                          # L1 threshold used if dataset success labels absent
 
 
 def compute_token_accuracy(predicted_token_ids, ground_truth_token_ids, mask):
@@ -209,6 +210,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     total_steps = 0
     total_successes = 0.0
     total_success_count = 0
+    threshold_successes = 0
+    threshold_total = 0
     
     # Track per-dimension errors
     from prismatic.vla.constants import ACTION_DIM
@@ -227,6 +230,10 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 pixel_values = batch["pixel_values"].to(f"cuda:{rank}")
             
             labels = batch["labels"].to(f"cuda:{rank}")
+            ground_truth_actions = batch.get("actions")
+            if ground_truth_actions is not None:
+                ground_truth_actions = ground_truth_actions.to(f"cuda:{rank}")
+            batch_sample_errors_np = None
             
             # Forward pass
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -270,6 +277,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 lwe_l1_value = torch.nn.functional.l1_loss(lwe_expectation, ground_truth_actions, reduction="mean").item()
                 total_lwe_l1_loss += lwe_l1_value
                 batch_l1_value = lwe_l1_value
+                batch_sample_errors_np = torch.abs(lwe_expectation - ground_truth_actions)
+                batch_sample_errors_np = batch_sample_errors_np.mean(dim=(1, 2)).detach().cpu().numpy()
 
                 flat_pred = lwe_expectation.view(-1, ACTION_DIM).cpu().numpy()
                 flat_gt = ground_truth_actions.view(-1, ACTION_DIM).cpu().numpy()
@@ -280,12 +289,18 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 pred_action_tokens = predicted_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
                 gt_action_tokens = ground_truth_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
 
+                sample_errors = []
                 for i in range(pred_action_tokens.shape[0]):
                     pred_actions = action_tokenizer.decode_token_ids_to_actions(pred_action_tokens[i].cpu().numpy())
                     gt_actions = action_tokenizer.decode_token_ids_to_actions(gt_action_tokens[i].cpu().numpy())
 
                     for dim in range(ACTION_DIM):
                         per_dim_errors[dim].append(abs(pred_actions[dim] - gt_actions[dim]))
+                    
+                    sample_errors.append(float(np.abs(pred_actions - gt_actions).mean()))
+                
+                if sample_errors:
+                    batch_sample_errors_np = np.asarray(sample_errors, dtype=np.float32)
 
                 l1_loss = compute_actions_l1_loss(
                     action_tokenizer,
@@ -303,6 +318,10 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                     valid_values = success_batch[valid_mask]
                     total_successes += valid_values.sum().item()
                     total_success_count += int(valid_mask.sum().item())
+            
+            if batch_sample_errors_np is not None and batch_sample_errors_np.size > 0:
+                threshold_successes += int((batch_sample_errors_np < cfg.success_threshold).sum())
+                threshold_total += int(batch_sample_errors_np.size)
             
             # Accumulate metrics
             total_loss += loss.item()
@@ -322,7 +341,12 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     avg_action_accuracy = total_action_accuracy / total_steps
     avg_l1_loss = total_l1_loss / total_steps
     avg_lwe_l1_loss = total_lwe_l1_loss / total_steps if cfg.use_lwe_decoder else None
-    success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    dataset_success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    threshold_success_rate = (threshold_successes / threshold_total) if threshold_total > 0 else None
+    success_rate = dataset_success_rate if dataset_success_rate is not None else threshold_success_rate
+    success_metric_source = (
+        "dataset" if dataset_success_rate is not None else ("threshold" if threshold_success_rate is not None else None)
+    )
     
     # Compute per-dimension statistics
     per_dim_stats = {}
@@ -354,7 +378,10 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
         print(f"Average LWE L1 Loss: {avg_lwe_l1_loss:.6f}")
     if success_rate is not None:
-        print(f"Success Rate: {success_rate:.6f} ({success_rate * 100:.2f}%)")
+        if success_metric_source == "dataset":
+            print(f"Success Rate (dataset annotations): {success_rate:.6f} ({success_rate * 100:.2f}%)")
+        else:
+            print(f"Success Rate (< {cfg.success_threshold} L1): {success_rate:.6f} ({success_rate * 100:.2f}%)")
     print(f"\nPer-Dimension Mean Absolute Errors:")
     for dim in range(ACTION_DIM):
         print(f"  Dim {dim:2d}: {per_dim_stats[f'dim_{dim}']['mean_abs_error']:.6f} "
@@ -373,6 +400,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
         "avg_l1_loss": avg_l1_loss,
         "per_dimension_stats": per_dim_stats,
         "success_rate": success_rate,
+        "success_metric": success_metric_source,
+        "success_threshold": cfg.success_threshold,
     }
     if cfg.use_lwe_decoder and avg_lwe_l1_loss is not None:
         results["avg_lwe_l1_loss"] = avg_lwe_l1_loss

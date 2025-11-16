@@ -39,6 +39,7 @@ class EvalConfig:
     action_dim: int = 14
     regression_loss_type: str = "l1"  # Must match training: 'l1', 'l2'/'mse', 'huber', 'smooth_l1'
     huber_delta: float = 1.0  # Delta parameter for Huber loss
+    success_threshold: float = 0.05  # Max per-sample L1 error to count as success
 
 def compute_l1_loss(predicted_actions, ground_truth_actions):
     """Compute L1 loss between predicted and ground truth actions"""
@@ -180,6 +181,8 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
     all_ground_truth_actions = []
     total_successes = 0.0
     total_success_count = 0
+    threshold_successes = 0
+    threshold_total = 0
     
     print(f"[Rank {rank}] Starting evaluation on {len(dataloader)} batches...")
     
@@ -273,13 +276,22 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
             l1_loss = compute_l1_loss(predicted_actions_flat, ground_truth_actions_flat)
             all_l1_losses.append(l1_loss)
             
+            sample_l1_errors = torch.abs(predicted_actions_flat - ground_truth_actions_flat).mean(dim=1)
+            threshold_successes += int((sample_l1_errors < cfg.success_threshold).sum().item())
+            threshold_total += batch_size
+            
             # Store for per-dimension analysis
             all_predicted_actions.append(predicted_actions_flat.cpu())
             all_ground_truth_actions.append(ground_truth_actions_flat.cpu())
     
     # Aggregate results
     avg_l1_loss = np.mean(all_l1_losses)
-    success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    dataset_success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    threshold_success_rate = (threshold_successes / threshold_total) if threshold_total > 0 else None
+    success_rate = dataset_success_rate if dataset_success_rate is not None else threshold_success_rate
+    success_metric_source = (
+        "dataset" if dataset_success_rate is not None else ("threshold" if threshold_success_rate is not None else None)
+    )
     
     # Compute per-dimension errors
     all_predicted_actions = torch.cat(all_predicted_actions, dim=0)
@@ -296,6 +308,8 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         'batch_size': cfg.batch_size,
         'per_dimension_stats': per_dim_stats,
         'success_rate': float(success_rate) if success_rate is not None else None,
+        'success_metric': success_metric_source,
+        'success_threshold': float(cfg.success_threshold),
     }
     
     if rank == 0:
@@ -305,7 +319,10 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         print(f"Average L1 Loss: {avg_l1_loss:.6f}")
         print(f"Number of batches: {len(dataloader)}")
         if success_rate is not None:
-            print(f"Success Rate: {success_rate:.6f} ({success_rate * 100:.2f}%)")
+            if success_metric_source == "dataset":
+                print(f"Success Rate (dataset annotations): {success_rate:.6f} ({success_rate * 100:.2f}%)")
+            else:
+                print(f"Success Rate (< {cfg.success_threshold} L1): {success_rate:.6f} ({success_rate * 100:.2f}%)")
         
         print("\nPer-Dimension Errors:")
         for dim in range(cfg.action_dim):
