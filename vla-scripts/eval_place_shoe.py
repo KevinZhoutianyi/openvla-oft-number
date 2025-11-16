@@ -49,6 +49,7 @@ class EvalConfig:
     
     # Output
     output_file: Optional[str] = None                        # Where to save results (default: checkpoint_dir/eval_results.json)
+    success_threshold: float = 0.05                          # Max per-sample L1 error counted as success
 
 
 def compute_token_accuracy(predicted_token_ids, ground_truth_token_ids, mask):
@@ -184,6 +185,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     total_action_accuracy = 0.0
     total_l1_loss = 0.0
     total_steps = 0
+    total_successes = 0
+    total_action_samples = 0
     
     # Track per-dimension errors
     from prismatic.vla.constants import ACTION_DIM
@@ -243,6 +246,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
             gt_action_tokens = ground_truth_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
             
             # Convert to continuous actions
+            batch_sample_errors = []
             for i in range(pred_action_tokens.shape[0]):
                 pred_actions = action_tokenizer.decode_token_ids_to_actions(pred_action_tokens[i].cpu().numpy())
                 gt_actions = action_tokenizer.decode_token_ids_to_actions(gt_action_tokens[i].cpu().numpy())
@@ -250,6 +254,13 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 # Track per-dimension errors
                 for dim in range(ACTION_DIM):
                     per_dim_errors[dim].append(abs(pred_actions[dim] - gt_actions[dim]))
+                
+                batch_sample_errors.append(np.abs(pred_actions - gt_actions).mean())
+            
+            if batch_sample_errors:
+                batch_sample_errors = np.array(batch_sample_errors, dtype=np.float32)
+                total_successes += int((batch_sample_errors < cfg.success_threshold).sum())
+                total_action_samples += batch_sample_errors.size
             
             # Compute L1 loss for this batch
             l1_loss = compute_actions_l1_loss(
@@ -276,6 +287,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     avg_loss = total_loss / total_steps
     avg_action_accuracy = total_action_accuracy / total_steps
     avg_l1_loss = total_l1_loss / total_steps
+    success_rate = (total_successes / total_action_samples) if total_action_samples > 0 else 0.0
     
     # Compute per-dimension statistics
     per_dim_stats = {}
@@ -296,6 +308,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     print(f"Average Loss: {avg_loss:.6f}")
     print(f"Average Action Token Accuracy: {avg_action_accuracy:.6f} ({avg_action_accuracy*100:.2f}%)")
     print(f"Average L1 Loss (Continuous Actions): {avg_l1_loss:.6f}")
+    print(f"Success Rate (< {cfg.success_threshold} L1): {success_rate:.4f} ({success_rate * 100:.2f}%)")
     print(f"\nPer-Dimension Mean Absolute Errors:")
     for dim in range(ACTION_DIM):
         print(f"  Dim {dim:2d}: {per_dim_stats[f'dim_{dim}']['mean_abs_error']:.6f} "
@@ -312,6 +325,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
         "avg_loss": avg_loss,
         "avg_action_token_accuracy": avg_action_accuracy,
         "avg_l1_loss": avg_l1_loss,
+        "success_rate": success_rate,
+        "success_threshold": cfg.success_threshold,
         "per_dimension_stats": per_dim_stats,
     }
     
@@ -326,4 +341,3 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
 
 if __name__ == "__main__":
     eval_place_shoe()
-

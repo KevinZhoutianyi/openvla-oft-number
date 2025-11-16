@@ -39,6 +39,7 @@ class EvalConfig:
     action_dim: int = 14
     regression_loss_type: str = "l1"  # Must match training: 'l1', 'l2'/'mse', 'huber', 'smooth_l1'
     huber_delta: float = 1.0  # Delta parameter for Huber loss
+    success_threshold: float = 0.05  # Max per-sample L1 error to count as success
 
 def compute_l1_loss(predicted_actions, ground_truth_actions):
     """Compute L1 loss between predicted and ground truth actions"""
@@ -178,6 +179,8 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
     all_l1_losses = []
     all_predicted_actions = []
     all_ground_truth_actions = []
+    total_successes = 0
+    total_samples = 0
     
     print(f"[Rank {rank}] Starting evaluation on {len(dataloader)} batches...")
     
@@ -263,6 +266,11 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
             l1_loss = compute_l1_loss(predicted_actions_flat, ground_truth_actions_flat)
             all_l1_losses.append(l1_loss)
             
+            # Track per-sample successes
+            sample_l1_errors = torch.abs(predicted_actions_flat - ground_truth_actions_flat).mean(dim=1)
+            total_successes += (sample_l1_errors < cfg.success_threshold).sum().item()
+            total_samples += batch_size
+            
             # Store for per-dimension analysis
             all_predicted_actions.append(predicted_actions_flat.cpu())
             all_ground_truth_actions.append(ground_truth_actions_flat.cpu())
@@ -278,11 +286,14 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         all_ground_truth_actions, 
         cfg.action_dim
     )
+    success_rate = (total_successes / total_samples) if total_samples > 0 else 0.0
     
     results = {
         'avg_l1_loss': float(avg_l1_loss),
         'num_batches': len(dataloader),
         'batch_size': cfg.batch_size,
+        'success_rate': float(success_rate),
+        'success_threshold': float(cfg.success_threshold),
         'per_dimension_stats': per_dim_stats,
     }
     
@@ -291,6 +302,7 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
         print("EVALUATION RESULTS (Regression Head)")
         print("="*80)
         print(f"Average L1 Loss: {avg_l1_loss:.6f}")
+        print(f"Success Rate (< {cfg.success_threshold} L1): {success_rate:.4f} ({success_rate * 100:.2f}%)")
         print(f"Number of batches: {len(dataloader)}")
         
         print("\nPer-Dimension Errors:")
@@ -316,4 +328,3 @@ def eval_place_shoe_regression(cfg: EvalConfig) -> None:
 
 if __name__ == "__main__":
     eval_place_shoe_regression()
-
