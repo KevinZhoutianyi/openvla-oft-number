@@ -49,6 +49,7 @@ class EvalConfig:
     
     # Output
     output_file: Optional[str] = None                        # Where to save results (default: checkpoint_dir/eval_results.json)
+    success_threshold: float = 0.05                          # L1 threshold used if dataset success labels absent
 
 
 def compute_token_accuracy(predicted_token_ids, ground_truth_token_ids, mask):
@@ -186,6 +187,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     total_steps = 0
     total_successes = 0.0
     total_success_count = 0
+    threshold_successes = 0
+    threshold_total = 0
     
     # Track per-dimension errors
     from prismatic.vla.constants import ACTION_DIM
@@ -243,6 +246,7 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
             # Extract only the action tokens
             pred_action_tokens = predicted_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
             gt_action_tokens = ground_truth_token_ids[current_action_mask].reshape(-1, ACTION_DIM)
+            batch_sample_errors = []
             
             # Convert to continuous actions
             for i in range(pred_action_tokens.shape[0]):
@@ -252,6 +256,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                 # Track per-dimension errors
                 for dim in range(ACTION_DIM):
                     per_dim_errors[dim].append(abs(pred_actions[dim] - gt_actions[dim]))
+                
+                batch_sample_errors.append(float(np.abs(pred_actions - gt_actions).mean()))
             
             # Compute L1 loss for this batch
             l1_loss = compute_actions_l1_loss(
@@ -270,6 +276,11 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
                     total_successes += valid_success.sum().item()
                     total_success_count += int(valid_mask.sum().item())
             
+            if batch_sample_errors:
+                errors_np = np.asarray(batch_sample_errors, dtype=np.float32)
+                threshold_successes += int((errors_np < cfg.success_threshold).sum())
+                threshold_total += int(errors_np.size)
+            
             # Accumulate metrics
             total_loss += loss.item()
             total_action_accuracy += action_accuracy.item()
@@ -287,7 +298,12 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     avg_loss = total_loss / total_steps
     avg_action_accuracy = total_action_accuracy / total_steps
     avg_l1_loss = total_l1_loss / total_steps
-    success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    dataset_success_rate = (total_successes / total_success_count) if total_success_count > 0 else None
+    threshold_success_rate = (threshold_successes / threshold_total) if threshold_total > 0 else None
+    success_rate = dataset_success_rate if dataset_success_rate is not None else threshold_success_rate
+    success_metric_source = (
+        "dataset" if dataset_success_rate is not None else ("threshold" if threshold_success_rate is not None else None)
+    )
     
     # Compute per-dimension statistics
     per_dim_stats = {}
@@ -309,7 +325,10 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
     print(f"Average Action Token Accuracy: {avg_action_accuracy:.6f} ({avg_action_accuracy*100:.2f}%)")
     print(f"Average L1 Loss (Continuous Actions): {avg_l1_loss:.6f}")
     if success_rate is not None:
-        print(f"Success Rate: {success_rate:.6f} ({success_rate * 100:.2f}%)")
+        if success_metric_source == "dataset":
+            print(f"Success Rate (dataset annotations): {success_rate:.6f} ({success_rate * 100:.2f}%)")
+        else:
+            print(f"Success Rate (< {cfg.success_threshold} L1): {success_rate:.6f} ({success_rate * 100:.2f}%)")
     print(f"\nPer-Dimension Mean Absolute Errors:")
     for dim in range(ACTION_DIM):
         print(f"  Dim {dim:2d}: {per_dim_stats[f'dim_{dim}']['mean_abs_error']:.6f} "
@@ -328,6 +347,8 @@ def eval_place_shoe(cfg: EvalConfig) -> None:
         "avg_l1_loss": avg_l1_loss,
         "per_dimension_stats": per_dim_stats,
         "success_rate": success_rate,
+        "success_metric": success_metric_source,
+        "success_threshold": cfg.success_threshold,
     }
     
     if rank == 0:
